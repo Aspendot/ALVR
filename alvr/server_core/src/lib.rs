@@ -103,6 +103,7 @@ pub struct ConnectionContext {
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
+    video_stream_sender: Mutex<Option<StreamSender<VideoPacketHeader>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
 
@@ -214,6 +215,7 @@ impl ServerCoreContext {
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
             video_channel_sender: Mutex::new(None),
+            video_stream_sender: Mutex::new(None),
             haptics_sender: Mutex::new(None),
         });
 
@@ -378,6 +380,17 @@ impl ServerCoreContext {
         static LAST_IDR_INSTANT: LazyLock<Mutex<Instant>> =
             LazyLock::new(|| Mutex::new(Instant::now()));
 
+        let mut header = VideoPacketHeader {
+            timestamp,
+            global_view_params,
+            is_idr,
+        };
+
+        self.connection_context
+            .tracking_manager
+            .read()
+            .unrecenter_view_params(&mut header.global_view_params);
+
         if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
             let buffer_size = nal_buffer.len();
 
@@ -424,11 +437,7 @@ impl ServerCoreContext {
                 }
 
                 let sender_result = sender.try_send(VideoPacket {
-                    header: VideoPacketHeader {
-                        timestamp,
-                        global_view_params,
-                        is_idr,
-                    },
+                    header,
                     payload: nal_buffer,
                 });
                 if matches!(sender_result, Err(TrySendError::Full(_))) {
@@ -446,6 +455,66 @@ impl ServerCoreContext {
             if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
                 let encoder_latency = stats.report_frame_encoded(timestamp, buffer_size);
 
+                self.connection_context
+                    .bitrate_manager
+                    .lock()
+                    .report_frame_encoded(timestamp, encoder_latency, buffer_size);
+            }
+        } else if let Some(sender) = &mut *self.connection_context.video_stream_sender.lock() {
+            let buffer_size = nal_buffer.len();
+
+            if is_idr {
+                STREAM_CORRUPTED.store(false, Ordering::SeqCst);
+                *LAST_IDR_INSTANT.lock() = Instant::now();
+            }
+
+            if let Switch::Enabled(config) = &SESSION_MANAGER
+                .read()
+                .settings()
+                .extra
+                .capture
+                .rolling_video_files
+                && Instant::now() > *LAST_IDR_INSTANT.lock() + Duration::from_secs(config.duration_s)
+            {
+                self.connection_context
+                    .events_sender
+                    .send(ServerCoreEvent::RequestIDR)
+                    .ok();
+
+                if is_idr {
+                    create_recording_file(
+                        &self.connection_context,
+                        SESSION_MANAGER.read().settings(),
+                    );
+                    *LAST_IDR_INSTANT.lock() = Instant::now();
+                }
+            }
+
+            if !STREAM_CORRUPTED.load(Ordering::SeqCst)
+                || !SESSION_MANAGER
+                    .read()
+                    .settings()
+                    .connection
+                    .avoid_video_glitching
+            {
+                if let Some(mirror) = &*self.connection_context.video_mirror_sender.lock() {
+                    mirror.send(nal_buffer.clone()).ok();
+                }
+
+                if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
+                    file.write_all(&nal_buffer).ok();
+                }
+
+                if let Ok(mut buffer) = sender.get_buffer(&header, nal_buffer.len()) {
+                    buffer.copy_from_slice(&nal_buffer);
+                    sender.send(buffer).ok();
+                }
+            } else {
+                warn!("Dropping video packet. Reason: Waiting for IDR frame");
+            }
+
+            if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
+                let encoder_latency = stats.report_frame_encoded(timestamp, buffer_size);
                 self.connection_context
                     .bitrate_manager
                     .lock()

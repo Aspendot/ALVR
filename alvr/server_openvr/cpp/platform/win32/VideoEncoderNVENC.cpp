@@ -4,6 +4,7 @@
 #include "alvr_server/Logger.h"
 #include "alvr_server/Settings.h"
 #include "alvr_server/Utils.h"
+#include "GazeStore.h"
 
 VideoEncoderNVENC::VideoEncoderNVENC(std::shared_ptr<CD3DRender> pD3DRender, int width, int height)
     : m_pD3DRender(pD3DRender)
@@ -122,9 +123,39 @@ void VideoEncoderNVENC::Transmit(
     m_pD3DRender->GetContext()->CopyResource(pInputTexture, pTexture);
 
     NV_ENC_PIC_PARAMS picParams = {};
+    NV_ENC_ROI_PARAMS roiParams = {};
     if (insertIDR) {
         Debug("Inserting IDR frame.\n");
         picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+    }
+    // Late-latch gaze ROI: center bias with a small QP delta
+    if (m_codec == ALVR_CODEC_H264 && Settings::Instance().m_gazeStreamEnabled) {
+        auto gaze = alvr::get_gaze_sample(
+            Settings::Instance().m_gazeFallbackCenterX, Settings::Instance().m_gazeFallbackCenterY
+        );
+        float cx = std::clamp(gaze.first, 0.0f, 1.0f);
+        float cy = std::clamp(gaze.second, 0.0f, 1.0f);
+
+        int roiW = (int)(m_renderWidth * 0.35f);
+        int roiH = (int)(m_renderHeight * 0.35f);
+        int left = (int)(cx * m_renderWidth - roiW * 0.5f);
+        int top = (int)(cy * m_renderHeight - roiH * 0.5f);
+        left = (left / 16) * 16;
+        top = (top / 16) * 16;
+        int right = std::min(left + roiW, m_renderWidth);
+        int bottom = std::min(top + roiH, m_renderHeight);
+
+#if defined(NV_ENC_ROI_PARAMS_VER)
+        roiParams.version = NV_ENC_ROI_PARAMS_VER;
+        roiParams.numROIRegions = 1;
+        roiParams.roiMode = NV_ENC_ROI_MODE_QP_DELTA;
+        roiParams.deltaQP[0] = -6;
+        roiParams.roiArea[0].left = left;
+        roiParams.roiArea[0].top = top;
+        roiParams.roiArea[0].right = right;
+        roiParams.roiArea[0].bottom = bottom;
+        picParams.roiParams = &roiParams;
+#endif
     }
     m_NvNecoder->EncodeFrame(vPacket, &picParams);
 
@@ -211,6 +242,7 @@ void VideoEncoderNVENC::FillEncodeConfig(
 
     NV_ENC_TUNING_INFO tuningPreset
         = static_cast<NV_ENC_TUNING_INFO>(Settings::Instance().m_nvencTuningPreset);
+    const bool ultraLowLatency = tuningPreset == NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
 
     m_NvNecoder->CreateDefaultEncoderParams(
         &initializeParams, encoderGUID, qualityPreset, tuningPreset
@@ -230,8 +262,9 @@ void VideoEncoderNVENC::FillEncodeConfig(
 
     // 16 is recommended when using reference frame invalidation. But it has caused bad visual
     // quality. Now, use 0 (use default).
-    uint32_t maxNumRefFrames = 0;
-    uint32_t gopLength = NVENC_INFINITE_GOPLENGTH;
+    uint32_t maxNumRefFrames = ultraLowLatency ? 1 : 0;
+    uint32_t gopLength
+        = ultraLowLatency ? static_cast<uint32_t>(refreshRate) : NVENC_INFINITE_GOPLENGTH;
 
     if (Settings::Instance().m_nvencMaxNumRefFrames != -1) {
         maxNumRefFrames = Settings::Instance().m_nvencMaxNumRefFrames;
@@ -245,6 +278,9 @@ void VideoEncoderNVENC::FillEncodeConfig(
         auto& config = encodeConfig.encodeCodecConfig.h264Config;
         config.repeatSPSPPS = 1;
         config.enableIntraRefresh = Settings::Instance().m_nvencEnableIntraRefresh;
+        if (ultraLowLatency) {
+            config.enableWeightedPrediction = 0;
+        }
 
         if (Settings::Instance().m_nvencIntraRefreshPeriod != -1) {
             config.intraRefreshPeriod = Settings::Instance().m_nvencIntraRefreshPeriod;
@@ -389,15 +425,16 @@ void VideoEncoderNVENC::FillEncodeConfig(
 
     uint32_t maxFrameSize = static_cast<uint32_t>(bitrate_bps / refreshRate);
     Debug("VideoEncoderNVENC: maxFrameSize=%d bits\n", maxFrameSize);
-    encodeConfig.rcParams.vbvBufferSize = maxFrameSize * 1.1;
-    encodeConfig.rcParams.vbvInitialDelay = maxFrameSize * 1.1;
+    const auto vbvSize = ultraLowLatency ? maxFrameSize : static_cast<uint32_t>(maxFrameSize * 1.1);
+    encodeConfig.rcParams.vbvBufferSize = vbvSize;
+    encodeConfig.rcParams.vbvInitialDelay = vbvSize;
     encodeConfig.rcParams.maxBitRate = static_cast<uint32_t>(bitrate_bps);
     encodeConfig.rcParams.averageBitRate = static_cast<uint32_t>(bitrate_bps);
-    if (Settings::Instance().m_nvencAdaptiveQuantizationMode == SpatialAQ) {
-        encodeConfig.rcParams.enableAQ = 1;
-    } else if (Settings::Instance().m_nvencAdaptiveQuantizationMode == TemporalAQ) {
-        encodeConfig.rcParams.enableTemporalAQ = 1;
-    }
+    encodeConfig.rcParams.enableAQ
+        = ultraLowLatency ? 0 : (Settings::Instance().m_nvencAdaptiveQuantizationMode == SpatialAQ);
+    encodeConfig.rcParams.enableTemporalAQ
+        = ultraLowLatency ? 0
+                          : (Settings::Instance().m_nvencAdaptiveQuantizationMode == TemporalAQ);
 
     if (Settings::Instance().m_nvencRateControlMode != -1) {
         encodeConfig.rcParams.rateControlMode

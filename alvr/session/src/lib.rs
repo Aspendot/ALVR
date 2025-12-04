@@ -10,7 +10,7 @@ use alvr_common::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json as json;
-use settings_schema::{NumberType, SchemaNode};
+use settings_schema::{NumberType, SchemaNode, Switch};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
@@ -99,6 +99,11 @@ pub struct OpenvrConfig {
     pub capture_frame_dir: String,
     pub amd_bitrate_corruption_fix: bool,
     pub use_separate_hand_trackers: bool,
+    pub gaze_stream_enabled: bool,
+    pub gaze_udp_port: u16,
+    pub gaze_fallback_center_x: f32,
+    pub gaze_fallback_center_y: f32,
+    pub gaze_smoothing_factor: f32,
 
     // these settings are not used on the C++ side, but we need them to correctly trigger a SteamVR
     // restart
@@ -152,6 +157,11 @@ impl Default for SessionConfig {
                 enable_color_correction: false,
                 linux_async_reprojection: false,
                 capture_frame_dir: "/tmp".into(),
+                gaze_stream_enabled: false,
+                gaze_udp_port: 7777,
+                gaze_fallback_center_x: 0.5,
+                gaze_fallback_center_y: 0.5,
+                gaze_smoothing_factor: 0.2,
                 ..<_>::default()
             },
             client_connections: HashMap::new(),
@@ -227,12 +237,49 @@ impl SessionConfig {
         let session_settings_json = json::to_value(&self.session_settings).unwrap();
         let schema = Settings::schema(settings::session_settings_default());
 
-        json::from_value::<Settings>(json_session_settings_to_settings(
+        let mut settings = json::from_value::<Settings>(json_session_settings_to_settings(
             &session_settings_json,
             &schema,
         ))
         .map_err(|e| dbg!(e))
-        .unwrap()
+        .unwrap();
+
+        apply_ultra_low_latency(&mut settings);
+
+        settings
+    }
+}
+
+fn apply_ultra_low_latency(settings: &mut Settings) {
+    if !settings.extra.ultra_low_latency {
+        return;
+    }
+
+    settings.video.preferred_fps = 120.0;
+    settings.video.preferred_codec = CodecType::H264;
+    settings.video.max_buffering_frames = 1.0;
+    settings.video.buffering_history_weight = 0.6;
+    settings.video.bitrate.history_size = settings.video.bitrate.history_size.min(64);
+
+    settings.video.encoder_config.quality_preset = EncoderQualityPreset::Speed;
+    settings.video.encoder_config.nvenc.tuning_preset = NvencTuningPreset::UltraLowLatency;
+    settings.video.encoder_config.nvenc.multi_pass = NvencMultiPass::Disabled;
+    settings.video.encoder_config.nvenc.adaptive_quantization_mode =
+        NvencAdaptiveQuantizationMode::Disabled;
+
+    settings.connection.stream_protocol = SocketProtocol::Udp;
+    settings.connection.dscp = Some(DscpTos::ExpeditedForwarding);
+    settings.connection.max_queued_server_video_frames =
+        settings.connection.max_queued_server_video_frames.min(3).max(2);
+    settings.connection.statistics_history_size =
+        settings.connection.statistics_history_size.min(64).max(16);
+
+    settings.extra.logging.log_to_disk = false;
+
+    settings.headset.max_prediction_ms = settings.headset.max_prediction_ms.min(40);
+    if let Switch::Enabled(controllers) = &mut settings.headset.controllers {
+        controllers.steamvr_pipeline_frames =
+            controllers.steamvr_pipeline_frames.min(1.5).max(1.0);
     }
 }
 

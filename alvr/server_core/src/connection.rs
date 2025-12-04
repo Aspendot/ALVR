@@ -40,6 +40,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+fn boost_thread_time_critical() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        // Pin to first two cores by default to reduce jitter.
+        SetThreadAffinityMask(GetCurrentThread(), 0b11);
+    }
+}
+
+#[cfg(not(windows))]
+fn boost_thread_time_critical() {}
+
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
@@ -233,6 +249,11 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         _client_gfx_debug: settings.extra.logging.debug_groups.client_gfx,
         _encoder_debug: settings.extra.logging.debug_groups.encoder,
         _decoder_debug: settings.extra.logging.debug_groups.decoder,
+        gaze_stream_enabled: settings.video.gaze_stream.enabled,
+        gaze_udp_port: settings.video.gaze_stream.udp_port,
+        gaze_fallback_center_x: settings.video.gaze_stream.fallback_center_x,
+        gaze_fallback_center_y: settings.video.gaze_stream.fallback_center_y,
+        gaze_smoothing_factor: settings.video.gaze_stream.smoothing_factor,
         ..old_config
     }
 }
@@ -854,36 +875,42 @@ fn connection_pipeline(
     let mut statics_receiver =
         stream_socket.subscribe_to_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
 
-    let (video_channel_sender, video_channel_receiver) =
-        std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
-    *ctx.video_channel_sender.lock() = Some(video_channel_sender);
+    let use_direct_video = initial_settings.extra.ultra_low_latency;
+    let mut video_send_thread = None;
+
     *ctx.haptics_sender.lock() = Some(haptics_sender);
 
-    let video_send_thread = thread::spawn({
-        let ctx = Arc::clone(&ctx);
-        let client_hostname = client_hostname.clone();
-        move || {
-            while is_streaming(&client_hostname) {
-                let VideoPacket {
-                    mut header,
-                    payload,
-                } = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
-                    Ok(packet) => packet,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                };
+    if use_direct_video {
+        *ctx.video_stream_sender.lock() = Some(video_sender);
+        *ctx.video_channel_sender.lock() = None;
+    } else {
+        let (video_channel_sender, video_channel_receiver) = std::sync::mpsc::sync_channel(
+            initial_settings.connection.max_queued_server_video_frames,
+        );
+        *ctx.video_channel_sender.lock() = Some(video_channel_sender);
 
-                ctx.tracking_manager
-                    .read()
-                    .unrecenter_view_params(&mut header.global_view_params);
+        video_send_thread = Some(thread::spawn({
+            let ctx = Arc::clone(&ctx);
+            let mut video_sender = video_sender;
+            let client_hostname = client_hostname.clone();
+            move || {
+                boost_thread_time_critical();
 
-                // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
-                video_sender
-                    .send_header_with_payload(&header, &payload)
-                    .ok();
+                while is_streaming(&client_hostname) {
+                    let VideoPacket { header, payload } =
+                        match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
+                            Ok(packet) => packet,
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        };
+
+                    video_sender
+                        .send_header_with_payload(&header, &payload)
+                        .ok();
+                }
             }
-        }
-    });
+        }));
+    }
 
     #[cfg_attr(target_os = "linux", allow(unused_variables))]
     let game_audio_thread = if let Switch::Enabled(config) =
@@ -894,6 +921,8 @@ fn connection_pipeline(
 
         let client_hostname = client_hostname.clone();
         thread::spawn(move || {
+            boost_thread_time_critical();
+
             #[cfg(not(target_os = "linux"))]
             while is_streaming(&client_hostname) {
                 {
@@ -1390,6 +1419,7 @@ fn connection_pipeline(
 
     // This requests shutdown from threads
     *ctx.video_channel_sender.lock() = None;
+    *ctx.video_stream_sender.lock() = None;
     *ctx.haptics_sender.lock() = None;
 
     *ctx.video_recording_file.lock() = None;
@@ -1425,7 +1455,9 @@ fn connection_pipeline(
 
     // Ensure shutdown of threads
     dbg_connection!("connection_pipeline: Shutdown threads");
-    video_send_thread.join().ok();
+    if let Some(video_send_thread) = video_send_thread {
+        video_send_thread.join().ok();
+    }
     game_audio_thread.join().ok();
     microphone_thread.join().ok();
     tracking_receive_thread.join().ok();

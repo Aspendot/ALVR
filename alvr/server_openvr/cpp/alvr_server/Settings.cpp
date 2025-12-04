@@ -118,6 +118,12 @@ void Settings::Load() {
 
         m_useSeparateHandTrackers = config.get("use_separate_hand_trackers").get<bool>();
 
+        m_gazeStreamEnabled = config.get("gaze_stream_enabled").get<bool>();
+        m_gazeUdpPort = (uint16_t)config.get("gaze_udp_port").get<int64_t>();
+        m_gazeFallbackCenterX = (float)config.get("gaze_fallback_center_x").get<double>();
+        m_gazeFallbackCenterY = (float)config.get("gaze_fallback_center_y").get<double>();
+        m_gazeSmoothingFactor = (float)config.get("gaze_smoothing_factor").get<double>();
+
         Info("Render Target: %d %d\n", m_renderWidth, m_renderHeight);
         Info("Refresh Rate: %d\n", m_refreshRate);
         m_loaded = true;

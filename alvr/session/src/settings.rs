@@ -690,6 +690,32 @@ pub struct UpscalingConfig {
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+#[schema(collapsible)]
+pub struct GazeFoveationConfig {
+    #[schema(strings(
+        help = "Enable UDP gaze input to drive foveated encoding. Uses fallback center if packets stop arriving."
+    ))]
+    pub enabled: bool,
+
+    #[schema(strings(help = "UDP port to listen for gaze packets (2x f32 little-endian x,y in [0..1])."))]
+    pub udp_port: u16,
+
+    #[schema(strings(
+        help = "If gaze packets stop, fall back to this normalized center (0.5,0.5 is screen center)."
+    ))]
+    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
+    pub fallback_center_x: f32,
+    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
+    pub fallback_center_y: f32,
+
+    #[schema(strings(
+        help = "Low values snap to gaze faster (less smoothing), high values smooth more (less jitter but more lag)."
+    ))]
+    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
+    pub smoothing_factor: f32,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct VideoConfig {
     #[schema(flag = "real-time")]
     pub passthrough: Switch<PassthroughMode>,
@@ -778,6 +804,10 @@ If you want to reduce the amount of pixelation on the edges, increase the center
 
     #[schema(strings(help = "Snapdragon Game Super Resolution client-side upscaling"))]
     pub upscaling: Switch<UpscalingConfig>,
+
+    #[schema(strings(display_name = "Gaze foveated streaming"))]
+    #[schema(flag = "real-time")]
+    pub gaze_stream: GazeFoveationConfig,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1563,6 +1593,12 @@ pub struct NewVersionPopupConfig {
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct ExtraConfig {
+    #[schema(strings(
+        display_name = "Ultra low latency",
+        help = "Aggressively minimizes buffering and enables NVENC ultra-low-latency tuning. For stable Wi-Fi 6/7 setups only."
+    ))]
+    pub ultra_low_latency: bool,
+
     #[schema(strings(display_name = "SteamVR Launcher"))]
     pub steamvr_launcher: SteamvrLauncher,
     pub capture: CaptureConfig,
@@ -1668,6 +1704,13 @@ pub fn session_settings_default() -> SettingsDefault {
                         variant: ClientsidePostProcessingSharpeningModeDefaultVariant::Quality,
                     },
                 },
+            },
+            gaze_stream: GazeFoveationConfigDefault {
+                enabled: false,
+                udp_port: 7777,
+                fallback_center_x: 0.5,
+                fallback_center_y: 0.5,
+                smoothing_factor: 0.2,
             },
             upscaling: SwitchDefault {
                 enabled: false,
@@ -2154,6 +2197,7 @@ pub fn session_settings_default() -> SettingsDefault {
             statistics_history_size: 256,
         },
         extra: ExtraConfigDefault {
+            ultra_low_latency: false,
             logging: LoggingConfigDefault {
                 client_log_report_level: SwitchDefault {
                     enabled: true,

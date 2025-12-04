@@ -91,4 +91,9 @@ public:
     int m_enableBodyTrackingFakeVive = false;
     int m_bodyTrackingHasLegs = false;
     bool m_useSeparateHandTrackers = false;
+    bool m_gazeStreamEnabled = false;
+    uint16_t m_gazeUdpPort = 7777;
+    float m_gazeFallbackCenterX = 0.5f;
+    float m_gazeFallbackCenterY = 0.5f;
+    float m_gazeSmoothingFactor = 0.2f;
 };

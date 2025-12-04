@@ -344,15 +344,24 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder<'_>, Duration) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
+        let low_buffering = self.config.max_buffering_frames <= 1.0;
+        let timeout_multiplier = if low_buffering {
+            0.65
+        } else {
+            DECODER_MAX_TIMEOUT_MULTIPLIER
+        };
+        let poll_sleep = if low_buffering {
+            Duration::from_micros(200)
+        } else {
+            Duration::from_micros(500)
+        };
         let frame_poll_deadline = Instant::now()
-            + Duration::from_secs_f32(
-                frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
-            );
+            + Duration::from_secs_f32(frame_interval.as_secs_f32() * timeout_multiplier);
         let mut frame_result = None;
         if let Some((_, source)) = &mut self.decoder {
             while frame_result.is_none() && Instant::now() < frame_poll_deadline {
                 frame_result = source.get_frame();
-                thread::sleep(Duration::from_micros(500));
+                thread::sleep(poll_sleep);
             }
         }
 
